@@ -1,0 +1,11 @@
+[project]
+name = "harri-web-mcp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp[cli]>=1.25.0",
+    "playwright>=1.57.0",
+    "python-dotenv>=1.2.1",
+]
