@@ -1,97 +1,176 @@
 import os
-import logging
-import httpx
+import json
+import requests
+import urllib.parse
+from pathlib import Path
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
+from requests.exceptions import HTTPError
 
+# Bootstrap
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
+mcp = FastMCP("harri-mcp")
 
-mcp = FastMCP("harri-web-mcp")
+HARRI_API_BASE = os.getenv("HARRI_API_BASE", "").rstrip("/")
+HARRI_BEARER = os.getenv("HARRI_BEARER")
 
-HARRI_API_BASE = os.getenv("HARRI_API_BASE", "https://dev.harridev.com/")
-HARRI_API_TOKEN = os.getenv("HARRI_API_TOKEN")
+BRAND_CONTEXT = {
+    "brand_id": 11312118,
+    "brand_type": "enterprise",
+    "active_brand_id": 11312118,
+    "active_brand_type": "enterprise",
+}
 
-if not HARRI_API_TOKEN:
-    raise RuntimeError("Missing HARRI_API_TOKEN in .env")
+# Session Setup (Shared for ALL tools & users)
+
+def load_cookie() -> str:
+    path = Path("harri_cookie.txt")
+    return path.read_text().strip() if path.exists() else ""
+
+session = requests.Session()
+
+session.cookies.set(
+    name="h_userContext",
+    value=urllib.parse.quote(json.dumps(BRAND_CONTEXT)),
+    domain=".harridev.com",
+    path="/",
+)
+
+session.headers.update({
+    "Authorization": f"Bearer {HARRI_BEARER}",
+    "Cookie": load_cookie(),
+    "Content-Type": "application/json;charset=UTF-8",
+    "Accept": "application/json",
+    "force-csrf": "true",
+    "Origin": "https://dev.harridev.com",
+    "Referer": "https://dev.harridev.com/",
+})
+
+# Shared Helpers (Reusable / Multi-user Safe)
+
+def fetch_all_users(brand_id: str) -> list:
+    url = f"https://gateway.harridev.com/team/api/v3/brands/{brand_id}/users"
+    r = session.get(url, params={"view": "ALL"}, timeout=20)
+    r.raise_for_status()
+    return r.json().get("data", [])
 
 
-def get_api_client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(
-        base_url=HARRI_API_BASE,
-        headers={
-            "Authorization": f"Bearer {HARRI_API_TOKEN}",
-            "Content-Type": "application/json",
-        },
-        timeout=30.0,
-    )
+def match_users_by_name(users: list, query: str) -> list:
+    q = query.lower()
+    return [
+        u for u in users
+        if q in f"{u.get('first_name','')} {u.get('last_name','')}".lower()
+    ]
 
 
-@mcp.tool()
-async def create_timecard(
-    employee_id: str,
-    start_time: str,
-    end_time: str,
-) -> str:
-
-    logging.info("Creating timecard via API")
-
-    payload = {
-        "employeeId": employee_id,
-        "clockIn": start_time,
-        "clockOut": end_time,
-        "breaks": {
-            "missed": True
-        },
-        "reason": "Added via AI agent",
+def format_user(user: dict) -> dict:
+    return {
+        "id": user["id"],
+        "first_name": user.get("first_name"),
+        "last_name": user.get("last_name"),
+        "email": user.get("email"),
+        "positions": [p.get("name") for p in user.get("positions", [])],
     }
 
-    async with get_api_client() as client:
-        response = await client.post(
-            "/timecards", 
-            json=payload,
-        )
-        response.raise_for_status()
-        data = response.json()
 
-    timecard_id = data.get("id", "unknown")
-
-    return f"Timecard created successfully (id={timecard_id})"
+def get_primary_position(user: dict) -> str | None:
+    return user.get("positions", [{}])[0].get("name")
 
 
-@mcp.tool()
-async def list_timesheet_reports() -> str:
+def fetch_timesheet(brand_id: str, user_id: int, day: str, view: str = "week"):
+    url = (
+        f"https://lpm-aggregator.harridev.com/api/v1/brands/{brand_id}"
+        f"/users/{user_id}/timesheets"
+    )
+    r = session.get(url, params={"day": day, "type": view}, timeout=20)
+    r.raise_for_status()
+    return r.json()
 
-    logging.info("Fetching timesheet reports via API")
+# MCP TOOLS
 
-    async with get_api_client() as client:
-        response = await client.get(
-            "/reports/timesheets",  
-            params={"range": "today"},
-        )
-        response.raise_for_status()
-        records = response.json().get("records", [])
-
-    if not records:
-        return "No timesheet records found."
-
-    results = []
-
-    for record in records:
-        results.append(
-            f"- {record.get('employeeName')} | "
-            f"{record.get('position')} | "
-            f"{record.get('payType')} | "
-            f"{record.get('status')} | "
-            f"{record.get('totalHours')}h"
-        )
-
-    return "\n".join(results)
+@mcp.tool
+def harri_list_employees(brand_id: str):
+    users = fetch_all_users(brand_id)
+    return {
+        "count": len(users),
+        "employees": [format_user(u) for u in users]
+    }
 
 
-def main():
-    mcp.run(transport="stdio")
+@mcp.tool
+def harri_create_timecard(
+    brand_id: str,
+    employee_name: str,
+    day: str,
+    clock_in: str,
+    clock_out: str,
+):
+    users = fetch_all_users(brand_id)
+    matches = match_users_by_name(users, employee_name)
 
+    if not matches:
+        return {
+            "status": "user_not_found",
+            "query": employee_name,
+        }
+
+    if len(matches) > 1:
+        return {
+            "status": "multiple_matches",
+            "count": len(matches),
+            "employees": [format_user(u) for u in matches],
+            "note": "Multiple users matched. Please select one by ID."
+        }
+
+    user = matches[0]
+    user_id = user["id"]
+
+    try:
+        timesheet = fetch_timesheet(brand_id, user_id, day)
+
+        return {
+            "status": "success",
+            "employee": f"{user.get('first_name')} {user.get('last_name')}",
+            "user_id": user_id,
+            "position": get_primary_position(user),
+            "date": day,
+            "requested_clock_in": clock_in,
+            "requested_clock_out": clock_out,
+            "timesheet": timesheet,
+            "note": "Manual timecard creation is not supported. Timesheet retrieved."
+        }
+
+    except HTTPError as e:
+        if e.response.status_code == 403:
+            return {
+                "status": "forbidden",
+                "user_id": user_id,
+                "reason": "Insufficient permissions",
+            }
+        raise
+
+
+@mcp.tool
+def harri_list_timesheets(brand_id: str, from_date: str, to_date: str):
+    url = (
+        f"{HARRI_API_BASE}/reporting-generator/brands/{brand_id}"
+        f"/team_live/timesheet/brand/{brand_id}/report"
+    )
+
+    r = session.get(
+        url,
+        params={
+            "from_date": from_date,
+            "to_date": to_date,
+            "hours_format": "DECIMAL",
+            "pay_types": ["SALARIED", "HOURLY"],
+        },
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.json()
+
+# Run MCP
 if __name__ == "__main__":
-    main()
+    mcp.run(transport="stdio")
